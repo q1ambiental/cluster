@@ -34,25 +34,25 @@ pela rede ou persistência de hora e métricas após desligamento.
   corrente além da capacidade do GPIO. Buzzer passivo precisa de PWM.
 - Barra de LEDs: GPIO5, 4, 2, 14, 12, 13, com resistores apropriados.
   Confira os pinos de strapping GPIO2/5/12: a carga não deve impedir o boot.
-- CAN: TX GPIO17, RX GPIO16, 500 kbit/s, via transceptor externo. Confirme níveis
+- CAN: TX GPIO17, RX GPIO16, 500 kbit/s configurados (o DBC não define bitrate), via transceptor externo. Confirme níveis
   lógicos do TJA1050/módulo e terminação nas duas extremidades do barramento.
 - Ajuste `TANK_L` (padrão 50 litros), `ADC_EMPTY` e `ADC_FULL` antes da demonstração.
   Os parâmetros padrão são hipóteses de simulação, não dados definidos pelo PDF.
 
-## Perfil CAN experimental para o sistema do professor
+## Perfil CAN do DBC do professor
 
-O PDF especifica os identificadores, mas não o layout dos sinais. Foi mantido
-o formato do código original para os sinais; o ID de transmissão foi alterado
-para **0x310**, informado pelo usuário. Esse perfil é uma hipótese de teste,
-não uma confirmação do DBC. Usa quadros clássicos e IDs de 11 bits:
+O perfil padrão foi conferido com `CANdb_Atividade01_Cluster_FELLYPE.dbc`.
+Todos os quadros descritos têm 8 bytes e identificadores padrão de 11 bits.
+A velocidade usa o byte 1 de `0x100`; temperatura usa o byte 0.
+Os sinais de velocidade, temperatura e cruise usam fator 1 e offset 0.
 
 | ID | Origem | Payload |
 |---|---|---|
 | `0x100` | PCM | Byte 0: temperatura em °C; byte 1: velocidade em km/h; ambos sem sinal |
 | `0x200` | BCM | Byte 0, bit 5: seta esquerda; bit 6: seta direita |
-| `0x310` | Cluster | Byte 0: velocidade definida; byte 1: cruise ativo (`0`/`1`) |
+| `0x300` | Cluster | Byte 0: velocidade definida; bit 0 do byte 1: cruise ativo; outros bits/bytes zerados |
 
-O cluster transmite `0x310` a cada 100 ms. PCM/BCM devem transmitir em intervalos
+O cluster transmite `0x300` a cada 100 ms. PCM/BCM devem transmitir em intervalos
 menores que o timeout de 500 ms, com margem. Ao perder PCM, o cluster desativa
 cruise, invalida velocidade/temperatura e apaga a barra. Ao perder BCM, invalida
 as setas. Ausência de sinal aparece no OLED desde a inicialização.
@@ -138,9 +138,9 @@ de PCM/BCM. Confirme que os LEDs e dados são invalidados após o timeout.
 
 No início do TXT, o bloco **PERFIL CAN EDITAVEL** centraliza:
 
-- `CLUSTER_TX_ID`: `0x310` (informado como ID usado na comunicação com o professor).
-- `CLUSTER_SPEED_RX_ID` e `CLUSTER_BODY_RX_ID`: `0x100` e `0x200`, hipóteses anteriores.
-- `CLUSTER_TX_DLC`: 2 bytes; `CLUSTER_CAN_BITRATE`: 500000 bit/s.
+- `CLUSTER_TX_ID`: `0x300`, mensagem `CruiseControl` definida pelo DBC.
+- `CLUSTER_SPEED_RX_ID` e `CLUSTER_BODY_RX_ID`: `0x100` e `0x200`, conforme o DBC.
+- `CLUSTER_TX_DLC`: 8 bytes, conforme o DBC; `CLUSTER_CAN_BITRATE`: 500000 bit/s, a confirmar na bancada.
 - `CLUSTER_TX_PERIOD_MS`: 100 ms.
 - `sig_*`: bit inicial, largura de 1–16 bits, ordem Intel/Motorola,
   sinal numérico com/sem sinal, fator e offset.
@@ -152,10 +152,15 @@ em que o bit inicial é o mais significativo do sinal. O valor físico é
 arredondando ao inteiro representável. Campos que não cabem no DLC,
 se sobrepõem no TX ou excedem sua representação são rejeitados.
 
-O payload TX padrão é `[velocidade_cruise, ativo]`: por exemplo, 50 km/h com
-cruise desligado transmite `32 00` em hexadecimal no ID `0x310`.
-Isso pode precisar mudar quando houver uma descrição das mensagens esperadas.
-O ID CAN identifica a mensagem: não funciona como endereço de destino.
+O payload TX padrão possui 8 bytes. `Velocidade_Cruise` ocupa os bits 0–7;
+`Cruise_Ativo` ocupa somente o bit 8, ambos Intel (`@1`), sem sinal, fator 1
+e offset 0. Por exemplo, 50 km/h com cruise desligado transmite
+`32 00 00 00 00 00 00 00` em hexadecimal no ID `0x300`; ligado transmite
+`32 01 00 00 00 00 00 00`. O ID CAN identifica a mensagem, não um destino.
+A faixa do DBC é 0–255 km/h; a interface mantém o limite de ajuste de 180 km/h.
+Os demais sinais do DBC (rotação, porta, freio, farol e iluminação recebida)
+não são exibidos por esta versão; a leitura de velocidade/temperatura/setas e
+a transmissão de cruise foram conferidas. Não houve teste no barramento físico.
 
 Quadros padrão clássicos de outros IDs são registrados no terminal, com ID,
 DLC e bytes em hexadecimal, no máximo uma mensagem desconhecida por segundo.
@@ -173,4 +178,4 @@ indicando falha TX quando a transmissão não é reconhecida.
 Os testes locais incluem vetores conhecidos Intel/Motorola de 16 bits,
 sinal com fator/offset e valor negativo, campo que atravessa bytes, rejeição
 por DLC insuficiente e montagem do payload TX. São testes do adaptador,
-não evidência de compatibilidade com o DBC do professor.
+com a configuração padrão comparada ao DBC. O funcionamento físico ainda exige teste de bancada.

@@ -2,8 +2,8 @@
  * ESP32 classico, ESP-IDF >= 5.5 (APIs modernas). v6.2 ainda nao validada.
  * CAN 500 kbit/s, quadros padrao: PCM 0x100 [temperatura C, km/h];
  * BCM 0x200: bits 5/6 do byte 0 = seta esquerda/direita;
- * Cluster 0x310 [velocidade cruise km/h, ativo 0/1]: ID informado pelo usuario.
- * Perfil de exemplo SEM DBC confirmado. Ajustar configuracao CAN abaixo.
+ * Cluster 0x300 DLC8: velocidade cruise bits0..7; ativo bit8.
+ * Perfil conferido com CANdb_Atividade01_Cluster_FELLYPE.dbc.
  * OLED SSD1306 128x64 I2C 0x3C: SDA21/SCL22. Buzzer ATIVO: GPIO23.
  * Botoes ativos em zero: trip32, cruise33, +/-18, mute19.
  * Encoder CLK25/DT26/SW27. ADC combustivel34/brilho35.
@@ -32,7 +32,8 @@
 #define LONG_US 1000000LL
 
 /* PERFIL CAN EDITAVEL. IDs sao identificadores de mensagem, nao destinos.
- * Hipoteses: RX 0x100/0x200; TX 0x310, DLC2, 500kbit/s, periodo100ms.
+ * DBC: RX 0x100/0x200 DLC8; TX 0x300 DLC8.
+ * Bitrate500kbit/s e periodo100ms sao parametros de bancada, nao definidos no DBC.
  * Para sinais DBC: start=bit inicial DBC; bits=largura (1..16);
  * motorola=false Intel @1; true Motorola @0; signed_value=true para '-'.
  * Valor fisico = valor bruto * factor + offset. Confirmar cada campo.
@@ -40,7 +41,7 @@
  * Isso nao gera ACK: outro no CAN ativo ainda precisa reconhecer os quadros.
  */
 #ifndef CLUSTER_TX_ID
-#define CLUSTER_TX_ID 0x310U
+#define CLUSTER_TX_ID 0x300U
 #endif
 #ifndef CLUSTER_SPEED_RX_ID
 #define CLUSTER_SPEED_RX_ID 0x100U
@@ -49,7 +50,7 @@
 #define CLUSTER_BODY_RX_ID 0x200U
 #endif
 #ifndef CLUSTER_TX_DLC
-#define CLUSTER_TX_DLC 2
+#define CLUSTER_TX_DLC 8
 #endif
 #ifndef CLUSTER_CAN_BITRATE
 #define CLUSTER_CAN_BITRATE 500000
@@ -74,7 +75,7 @@ static const CanSignal sig_speed = {8,8,false,false,1,0};
 static const CanSignal sig_left = {5,1,false,false,1,0};
 static const CanSignal sig_right = {6,1,false,false,1,0};
 static const CanSignal sig_cruise_speed = {0,8,false,false,1,0};
-static const CanSignal sig_cruise_active = {8,8,false,false,1,0};
+static const CanSignal sig_cruise_active = {8,1,false,false,1,0};
 
 static bool signal_positions(CanSignal sig, unsigned len, unsigned positions[16]) {
     if (!len || len>8 || !sig.bits || sig.bits>16 ||
@@ -281,6 +282,10 @@ int main(void) {
     uint8_t payload[8]; double value;
     assert(cruise_payload(payload,CLUSTER_TX_DLC,50,true));
     assert(payload[0]==50 && payload[1]==1);
+    for (unsigned i=2;i<CLUSTER_TX_DLC;i++) assert(payload[i]==0);
+    assert(cruise_payload(payload,CLUSTER_TX_DLC,180,false));
+    assert(payload[0]==180 && payload[1]==0);
+    for (unsigned i=2;i<CLUSTER_TX_DLC;i++) assert(payload[i]==0);
     assert(!cruise_payload(payload,1,50,true));
     CanSignal little={0,16,false,false,0.1,-40};
     uint8_t known_le[]={0x34,0x12};
@@ -530,7 +535,7 @@ void app_main(void) {
     uint8_t validation[CLUSTER_TX_DLC];
     ESP_ERROR_CHECK(cruise_payload(validation,sizeof(validation),0,false) &&
                     cruise_payload(validation,sizeof(validation),180,true) ? ESP_OK : ESP_ERR_INVALID_ARG);
-    ESP_LOGI(TAG,"Perfil experimental TX=0x%03x DLC=%d bitrate=%d; SEM DBC confirmado",
+    ESP_LOGI(TAG,"Perfil DBC TX=0x%03x DLC=%d bitrate=%d",
              (unsigned)CLUSTER_TX_ID,CLUSTER_TX_DLC,CLUSTER_CAN_BITRATE);
     rx_queue=xQueueCreate(64,sizeof(Rx)); ESP_ERROR_CHECK(rx_queue ? ESP_OK : ESP_ERR_NO_MEM);
     tx_results=xQueueCreate(1,sizeof(bool)); ESP_ERROR_CHECK(tx_results ? ESP_OK : ESP_ERR_NO_MEM);
