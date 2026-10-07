@@ -39,6 +39,93 @@ pela rede ou persistência de hora e métricas após desligamento.
 - Ajuste `TANK_L` (padrão 50 litros), `ADC_EMPTY` e `ADC_FULL` antes da demonstração.
   Os parâmetros padrão são hipóteses de simulação, não dados definidos pelo PDF.
 
+## Onde alterar os pinos e endereços no código
+
+Abra `codigotxt.txt` e procure **ALTERE AQUI: PINOS E ENDERECO DO OLED**, perto
+do início. Altere o número do `#define` correspondente à sua ligação; os valores
+são números GPIO do ESP32, não a posição física no conector. O programa usa esses
+nomes na inicialização e na leitura/acionamento dos periféricos.
+
+| O que mudar | Constante no TXT | Padrão |
+|---|---|---|
+| SDA / SCL do OLED | `PIN_OLED_SDA` / `PIN_OLED_SCL` | 21 / 22 |
+| Endereço I²C do OLED | `OLED_I2C_ADDRESS` | `0x3CU` |
+| Frequência I²C | `OLED_I2C_SPEED_HZ` | 400000 Hz |
+| TX / RX do CAN | `PIN_CAN_TX` / `PIN_CAN_RX` | 17 / 16 |
+| Buzzer ativo | `PIN_BUZZER` | 23 |
+| Botão Trip | `PIN_BUTTON_TRIP` | 32 |
+| Botão Cruise | `PIN_BUTTON_CRUISE` | 33 |
+| Botão de ajuste +/- | `PIN_BUTTON_ADJUST` | 18 |
+| Botão Mute | `PIN_BUTTON_MUTE` | 19 |
+| Encoder CLK / DT / SW | `PIN_ENCODER_CLK` / `PIN_ENCODER_DT` / `PIN_ENCODER_SW` | 25 / 26 / 27 |
+| Potenciômetro de combustível | `PIN_FUEL_ADC` | 34 |
+| Potenciômetro de brilho | `PIN_BRIGHTNESS_ADC` | 35 |
+| Seis segmentos de LEDs | `PIN_LED_1` até `PIN_LED_6` | 5, 4, 2, 14, 12, 13 |
+
+Exemplo: se SDA/SCL estiverem ligados nos GPIOs 18/19 e seu OLED usar `0x3D`:
+
+```c
+#define PIN_OLED_SDA       18
+#define PIN_OLED_SCL       19
+#define OLED_I2C_ADDRESS 0x3DU
+```
+
+Nesse exemplo, **também remapeie os botões de ajuste e mute**, que originalmente
+usam GPIO18/19, para GPIOs disponíveis. Não conecte periféricos diferentes ao
+mesmo GPIO. Preserve as restrições da placa: GPIO34–39 são somente entrada;
+GPIOs usados pelo flash/PSRAM e pinos de boot precisam ser considerados.
+
+Para os potenciômetros, escolha dois GPIOs distintos de **ADC1** do ESP32
+clássico (GPIO32–39, conforme disponibilidade da placa). O SDK converte o GPIO
+para o canal ADC automaticamente: não é necessário procurar `ADC_CHANNEL_6`
+ou `ADC_CHANNEL_7` no restante do código. Um GPIO sem ADC ou pertencente a ADC2
+é rejeitado na inicialização. Os valores `ADC_EMPTY`/`ADC_FULL` calibram o
+combustível e `TANK_L` define a capacidade do tanque.
+
+### Onde mudar o ID CAN, por exemplo de 0x300 para 0x310
+
+Procure **ALTERE AQUI: PERFIL CAN EDITAVEL**. No bloco `CLUSTER_TX_ID`, troque:
+
+```c
+#ifndef CLUSTER_TX_ID
+#define CLUSTER_TX_ID 0x300U
+#endif
+```
+
+por:
+
+```c
+#ifndef CLUSTER_TX_ID
+#define CLUSTER_TX_ID 0x310U
+#endif
+```
+
+Isso altera somente o identificador transmitido; o payload e os IDs recebidos
+continuam iguais. **O DBC atual exige `0x300`: use `0x310` apenas se o professor
+confirmar que o receptor espera esse ID.** Não é necessário alterar o arquivo
+DBC apenas para experimentar no firmware. O `U` indica uma constante inteira
+sem sinal e deve ser mantido nos exemplos.
+
+| Parâmetro CAN | Onde alterar | Padrão |
+|---|---|---|
+| ID transmitido pelo cluster | `CLUSTER_TX_ID` | `0x300U` |
+| ID recebido de velocidade/temperatura | `CLUSTER_SPEED_RX_ID` | `0x100U` |
+| ID recebido de setas | `CLUSTER_BODY_RX_ID` | `0x200U` |
+| Quantidade de bytes transmitidos | `CLUSTER_TX_DLC` | 8 |
+| Bitrate do barramento | `CLUSTER_CAN_BITRATE` | 500000 bit/s |
+| Período de transmissão | `CLUSTER_TX_PERIOD_MS` | 100 ms |
+| Timeout de recepção | `CAN_TIMEOUT_US` | 500000 µs |
+| Permitir cruise sem velocidade na bancada | `CLUSTER_BENCH_MODE` | 0; usar 1 para esse teste |
+
+O endereço I²C `0x3C` e o ID CAN `0x300` pertencem a barramentos diferentes:
+alterar um não altera o outro. Para mudar posição dos bits, escala ou offset,
+use os descritores `sig_*`, explicados em “Adaptação a possíveis mensagens”.
+
+**Depois de qualquer alteração, salve, recompile e grave o novo firmware na
+placa.** Editar o TXT ou baixar arquivos não atualiza o firmware já gravado.
+Os testes locais validam a lógica; os pinos escolhidos precisam ser conferidos
+na montagem real.
+
 ## Perfil CAN do DBC do professor
 
 O perfil padrão foi conferido com `CANdb_Atividade01_Cluster_FELLYPE.dbc`.

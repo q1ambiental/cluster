@@ -4,6 +4,7 @@
  * BCM 0x200: bits 5/6 do byte 0 = seta esquerda/direita;
  * Cluster 0x300 DLC8: velocidade cruise bits0..7; ativo bit8.
  * Perfil conferido com CANdb_Atividade01_Cluster_FELLYPE.dbc.
+ * Valores padrao (para alterar, veja os blocos ALTERE AQUI/PERFIL CAN):
  * OLED SSD1306 128x64 I2C 0x3C: SDA21/SCL22. Buzzer ATIVO: GPIO23.
  * Botoes ativos em zero: trip32, cruise33, +/-18, mute19.
  * Encoder CLK25/DT26/SW27. ADC combustivel34/brilho35.
@@ -25,13 +26,48 @@
 #include <string.h>
 #include <math.h>
 
-#define CAN_TIMEOUT_US 500000LL
-#define TANK_L 50.0f
-#define ADC_EMPTY 0
-#define ADC_FULL 4095
+/* ===== ALTERE AQUI: PINOS E ENDERECO DO OLED =====
+ * Numeros abaixo sao GPIOs do ESP32 classico, nao posicoes fisicas do conector.
+ * Troque apenas os valores dos #define; o restante do codigo usa estes nomes.
+ * Nao reutilize o mesmo GPIO para perifericos diferentes.
+ */
+#define PIN_OLED_SDA       21   // Fio SDA do OLED; exemplo: trocar 21 pelo GPIO escolhido.
+#define PIN_OLED_SCL       22   // Fio SCL do OLED.
+#define OLED_I2C_ADDRESS 0x3CU  // Endereco I2C de 7 bits; alguns modulos usam 0x3D.
+#define OLED_I2C_SPEED_HZ 400000 // Frequencia I2C, em Hz; usar 100000 se necessario.
+#define PIN_CAN_TX         17  // Saida do ESP32 para TXD do transceptor CAN.
+#define PIN_CAN_RX         16  // Entrada do ESP32 vinda de RXD do transceptor CAN.
+#define PIN_BUZZER         23  // Buzzer ATIVO (usa nivel digital, nao PWM).
+#define PIN_BUTTON_TRIP    32  // Botao de Trip A/B, ligado ao GND.
+#define PIN_BUTTON_CRUISE  33  // Botao de ligar/desligar cruise, ligado ao GND.
+#define PIN_BUTTON_ADJUST  18  // Botao +/- velocidade, ligado ao GND.
+#define PIN_BUTTON_MUTE    19  // Botao de mute, ligado ao GND.
+#define PIN_ENCODER_CLK    25  // Encoder: sinal CLK/A.
+#define PIN_ENCODER_DT     26  // Encoder: sinal DT/B.
+#define PIN_ENCODER_SW     27  // Encoder: botao SW, ligado ao GND.
+#define PIN_FUEL_ADC       34  // Potenciometro de combustivel: GPIO ADC1.
+#define PIN_BRIGHTNESS_ADC 35  // Potenciometro de brilho: GPIO ADC1.
+/* ADC1 no ESP32 classico: GPIO32..39, conforme disponibilidade da placa.
+ * O canal ADC e calculado automaticamente a partir do GPIO. ADC2 e rejeitado.
+ * GPIO34..39 sao somente entrada e nao servem para LEDs/buzzer/SDA/SCL/TX.
+ */
+#define PIN_LED_1           5  // Primeiro segmento: acende a partir de 25 km/h.
+#define PIN_LED_2           4  // Segundo segmento: 50 km/h.
+#define PIN_LED_3           2  // Terceiro segmento: 75 km/h.
+#define PIN_LED_4          14  // Quarto segmento: 100 km/h.
+#define PIN_LED_5          12  // Quinto segmento: 125 km/h.
+#define PIN_LED_6          13  // Sexto segmento: 150 km/h.
+/* GPIO2/5/12 influenciam o boot; confira a placa e a carga conectada.
+ * OLED_I2C_ADDRESS nao e ID CAN. IDs CAN sao configurados no bloco abaixo.
+ */
+
+#define CAN_TIMEOUT_US 500000LL // Timeout de recepcao, em microssegundos (500 ms).
+#define TANK_L 50.0f // Capacidade do tanque, em litros: ajuste para sua simulacao.
+#define ADC_EMPTY 0 // Leitura bruta do potenciometro com tanque vazio.
+#define ADC_FULL 4095 // Leitura bruta com tanque cheio (ADC de 12 bits).
 #define LONG_US 1000000LL
 
-/* PERFIL CAN EDITAVEL. IDs sao identificadores de mensagem, nao destinos.
+/* ===== ALTERE AQUI: PERFIL CAN EDITAVEL ===== IDs sao identificadores de mensagem, nao destinos.
  * DBC: RX 0x100/0x200 DLC8; TX 0x300 DLC8.
  * Bitrate500kbit/s e periodo100ms sao parametros de bancada, nao definidos no DBC.
  * Para sinais DBC: start=bit inicial DBC; bits=largura (1..16);
@@ -41,25 +77,26 @@
  * Isso nao gera ACK: outro no CAN ativo ainda precisa reconhecer os quadros.
  */
 #ifndef CLUSTER_TX_ID
-#define CLUSTER_TX_ID 0x300U
+#define CLUSTER_TX_ID 0x300U // ID transmitido: para usar 0x310, altere SOMENTE para 0x310U.
+// DBC atual exige 0x300. Use 0x310 apenas se o receptor esperar esse ID.
 #endif
 #ifndef CLUSTER_SPEED_RX_ID
-#define CLUSTER_SPEED_RX_ID 0x100U
+#define CLUSTER_SPEED_RX_ID 0x100U // ID recebido contendo velocidade e temperatura.
 #endif
 #ifndef CLUSTER_BODY_RX_ID
-#define CLUSTER_BODY_RX_ID 0x200U
+#define CLUSTER_BODY_RX_ID 0x200U // ID recebido contendo as setas.
 #endif
 #ifndef CLUSTER_TX_DLC
-#define CLUSTER_TX_DLC 8
+#define CLUSTER_TX_DLC 8 // Quantidade de bytes TX: DBC atual exige 8.
 #endif
 #ifndef CLUSTER_CAN_BITRATE
-#define CLUSTER_CAN_BITRATE 500000
+#define CLUSTER_CAN_BITRATE 500000 // Bitrate CAN em bit/s: deve coincidir com o outro no.
 #endif
 #ifndef CLUSTER_TX_PERIOD_MS
-#define CLUSTER_TX_PERIOD_MS 100
+#define CLUSTER_TX_PERIOD_MS 100 // Intervalo entre mensagens transmitidas, em ms.
 #endif
 #ifndef CLUSTER_BENCH_MODE
-#define CLUSTER_BENCH_MODE 0
+#define CLUSTER_BENCH_MODE 0 // 1 permite testar cruise sem receber velocidade; nao gera ACK.
 #endif
 #if CLUSTER_TX_DLC < 1 || CLUSTER_TX_DLC > 8 || CLUSTER_TX_ID > 0x7ff || CLUSTER_SPEED_RX_ID > 0x7ff || CLUSTER_BODY_RX_ID > 0x7ff || CLUSTER_TX_PERIOD_MS < 1
 #error "Perfil requer CAN classico padrao: IDs 11 bits, DLC1..8 e periodo positivo"
@@ -330,10 +367,11 @@ int main(void) {
 #endif
 
 static const char *TAG = "cluster";
-static const int led_pins[] = {5,4,2,14,12,13};
-static const int button_pins[] = {32,33,18,19,27};
+static const int led_pins[] = {PIN_LED_1,PIN_LED_2,PIN_LED_3,PIN_LED_4,PIN_LED_5,PIN_LED_6};
+static const int button_pins[] = {PIN_BUTTON_TRIP,PIN_BUTTON_CRUISE,PIN_BUTTON_ADJUST,PIN_BUTTON_MUTE,PIN_ENCODER_SW};
 static QueueHandle_t rx_queue, tx_results;
 static adc_oneshot_unit_handle_t adc;
+static adc_channel_t fuel_channel, brightness_channel;
 static i2c_master_dev_handle_t oled;
 static twai_node_handle_t can;
 /* Buffer TX persistente: driver moderno nao copia o quadro/payload. */
@@ -471,7 +509,7 @@ static void transmit(int64_t now) {
 static void controller(void *arg) {
     (void)arg;
     Button buttons[5] = {0};
-    int old_ab = (gpio_get_level(25)<<1)|gpio_get_level(26), steps=0;
+    int old_ab = (gpio_get_level(PIN_ENCODER_CLK)<<1)|gpio_get_level(PIN_ENCODER_DT), steps=0;
     const int8_t quadrature[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
     int64_t adc_at=0, screen_at=0, recovery_at=0, unknown_at=-1000000;
     float filtered_fuel=-1, filtered_brightness=-1;
@@ -489,7 +527,7 @@ static void controller(void *arg) {
         }
         int64_t now = esp_timer_get_time(); advance(now);
         for (int i=0;i<5;i++) action(i, button_update(&buttons[i], !gpio_get_level(button_pins[i]), now), now);
-        int ab = (gpio_get_level(25)<<1)|gpio_get_level(26);
+        int ab = (gpio_get_level(PIN_ENCODER_CLK)<<1)|gpio_get_level(PIN_ENCODER_DT);
         if ((old_ab^ab)==3) steps=0; /* Transicao impossivel: descarta salto. */
         else steps += quadrature[(old_ab<<2)|ab];
         old_ab=ab;
@@ -503,8 +541,8 @@ static void controller(void *arg) {
             adc_at=now; int sum_f=0,sum_b=0; bool ok=true;
             for (int i=0;i<16;i++) {
                 int f,b;
-                if (adc_oneshot_read(adc,ADC_CHANNEL_6,&f)!=ESP_OK ||
-                    adc_oneshot_read(adc,ADC_CHANNEL_7,&b)!=ESP_OK) { ok=false;break; }
+                if (adc_oneshot_read(adc,fuel_channel,&f)!=ESP_OK ||
+                    adc_oneshot_read(adc,brightness_channel,&b)!=ESP_OK) { ok=false;break; }
                 sum_f+=f;sum_b+=b;
             }
             if (ok) {
@@ -521,7 +559,7 @@ static void controller(void *arg) {
             } else { m.adc_ok=false; m.consumption_ready=false; ESP_LOGW(TAG,"Falha ADC"); }
         }
         for (int i=0;i<6;i++) gpio_set_level(led_pins[i],m.pcm && m.speed>=(i+1)*25);
-        gpio_set_level(23,!m.mute && now<m.beep_until); /* Buzzer ativo, sem PWM de audio. */
+        gpio_set_level(PIN_BUZZER,!m.mute && now<m.beep_until); /* Buzzer ativo, sem PWM de audio. */
         twai_node_status_t status;
         if (twai_node_get_info(can,&status,NULL)==ESP_OK && status.state==TWAI_ERROR_BUS_OFF) {
             m.tx_error=true;m.cruise=false;
@@ -539,29 +577,35 @@ void app_main(void) {
              (unsigned)CLUSTER_TX_ID,CLUSTER_TX_DLC,CLUSTER_CAN_BITRATE);
     rx_queue=xQueueCreate(64,sizeof(Rx)); ESP_ERROR_CHECK(rx_queue ? ESP_OK : ESP_ERR_NO_MEM);
     tx_results=xQueueCreate(1,sizeof(bool)); ESP_ERROR_CHECK(tx_results ? ESP_OK : ESP_ERR_NO_MEM);
-    uint64_t inputs=(1ULL<<25)|(1ULL<<26);
+    uint64_t inputs=(1ULL<<PIN_ENCODER_CLK)|(1ULL<<PIN_ENCODER_DT);
     for (int i=0;i<5;i++) inputs|=1ULL<<button_pins[i];
     gpio_config_t in={.pin_bit_mask=inputs,.mode=GPIO_MODE_INPUT,.pull_up_en=GPIO_PULLUP_ENABLE};
     ESP_ERROR_CHECK(gpio_config(&in));
-    uint64_t outputs=1ULL<<23;for(int i=0;i<6;i++)outputs|=1ULL<<led_pins[i];
+    uint64_t outputs=1ULL<<PIN_BUZZER;for(int i=0;i<6;i++)outputs|=1ULL<<led_pins[i];
     gpio_config_t out={.pin_bit_mask=outputs,.mode=GPIO_MODE_OUTPUT};
     ESP_ERROR_CHECK(gpio_config(&out));
-    ESP_ERROR_CHECK(gpio_set_level(23,0));
+    ESP_ERROR_CHECK(gpio_set_level(PIN_BUZZER,0));
     for(int i=0;i<6;i++)ESP_ERROR_CHECK(gpio_set_level(led_pins[i],0));
+    /* Alterou PIN_*_ADC? O SDK descobre o canal; mantenha ambos em ADC1. */
+    adc_unit_t fuel_unit, brightness_unit;
+    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(PIN_FUEL_ADC,&fuel_unit,&fuel_channel));
+    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(PIN_BRIGHTNESS_ADC,&brightness_unit,&brightness_channel));
+    ESP_ERROR_CHECK(fuel_unit==ADC_UNIT_1 && brightness_unit==ADC_UNIT_1 &&
+                    fuel_channel!=brightness_channel ? ESP_OK : ESP_ERR_INVALID_ARG);
     adc_oneshot_unit_init_cfg_t au={.unit_id=ADC_UNIT_1};
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&au,&adc));
     adc_oneshot_chan_cfg_t ac={.atten=ADC_ATTEN_DB_12,.bitwidth=ADC_BITWIDTH_12};
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,ADC_CHANNEL_6,&ac));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,ADC_CHANNEL_7,&ac));
-    i2c_master_bus_config_t bus={.i2c_port=I2C_NUM_0,.sda_io_num=21,.scl_io_num=22,
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,fuel_channel,&ac));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,brightness_channel,&ac));
+    i2c_master_bus_config_t bus={.i2c_port=I2C_NUM_0,.sda_io_num=PIN_OLED_SDA,.scl_io_num=PIN_OLED_SCL,
         .clk_source=I2C_CLK_SRC_DEFAULT,.glitch_ignore_cnt=7,.flags.enable_internal_pullup=true};
     i2c_master_bus_handle_t handle; ESP_ERROR_CHECK(i2c_new_master_bus(&bus,&handle));
-    i2c_device_config_t dev={.dev_addr_length=I2C_ADDR_BIT_LEN_7,.device_address=0x3c,.scl_speed_hz=400000};
+    i2c_device_config_t dev={.dev_addr_length=I2C_ADDR_BIT_LEN_7,.device_address=OLED_I2C_ADDRESS,.scl_speed_hz=OLED_I2C_SPEED_HZ};
     ESP_ERROR_CHECK(i2c_master_bus_add_device(handle,&dev,&oled));
     const uint8_t init[]={0xae,0xd5,0x80,0xa8,0x3f,0xd3,0,0x40,0x8d,0x14,0x20,2,
                          0xa1,0xc8,0xda,0x12,0x81,0xff,0xd9,0xf1,0xdb,0x40,0xa4,0xa6,0xaf};
     ESP_ERROR_CHECK(oled_commands(init,sizeof(init)));
-    twai_onchip_node_config_t cfg={.io_cfg={.tx=17,.rx=16,.quanta_clk_out=-1,.bus_off_indicator=-1},
+    twai_onchip_node_config_t cfg={.io_cfg={.tx=PIN_CAN_TX,.rx=PIN_CAN_RX,.quanta_clk_out=-1,.bus_off_indicator=-1},
         .bit_timing.bitrate=CLUSTER_CAN_BITRATE,.fail_retry_cnt=3,.tx_queue_depth=1,.flags.no_receive_rtr=true};
     ESP_ERROR_CHECK(twai_new_node_onchip(&cfg,&can));
     twai_event_callbacks_t callbacks={.on_rx_done=on_rx,.on_tx_done=on_tx};
