@@ -1,0 +1,3 @@
+C:/Users/felly/Downloads/Atividade CAN/AtividadeCAN-1/AtividadeCAN/build-current/CMakeFiles/CMakeScratch/TryCompile-wftkzl/CMakeFiles/cmTC_e9443.dir
+C:/Users/felly/Downloads/Atividade CAN/AtividadeCAN-1/AtividadeCAN/build-current/CMakeFiles/CMakeScratch/TryCompile-wftkzl/CMakeFiles/edit_cache.dir
+C:/Users/felly/Downloads/Atividade CAN/AtividadeCAN-1/AtividadeCAN/build-current/CMakeFiles/CMakeScratch/TryCompile-wftkzl/CMakeFiles/rebuild_cache.dir
