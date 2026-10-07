@@ -1,595 +1,567 @@
-#include <stdio.h>
+/* Cluster/IHM - Grupo 3. Salvar como main/cluster.c para compilar.
+ * ESP32 classico, ESP-IDF >= 5.5 (APIs modernas). v6.2 ainda nao validada.
+ * CAN 500 kbit/s, quadros padrao: PCM 0x100 [temperatura C, km/h];
+ * BCM 0x200: bits 5/6 do byte 0 = seta esquerda/direita;
+ * Cluster 0x310 [velocidade cruise km/h, ativo 0/1]: ID informado pelo usuario.
+ * Perfil de exemplo SEM DBC confirmado. Ajustar configuracao CAN abaixo.
+ * OLED SSD1306 128x64 I2C 0x3C: SDA21/SCL22. Buzzer ATIVO: GPIO23.
+ * Botoes ativos em zero: trip32, cruise33, +/-18, mute19.
+ * Encoder CLK25/DT26/SW27. ADC combustivel34/brilho35.
+ * LEDs 5,4,2,14,12,13. Conferir pinos de strapping da placa antes de ligar.
+ * Trip: toque alterna A/B; segurar 1 s zera o selecionado.
+ * Cruise +/-: toque aumenta 5; segurar 1 s diminui 5 (sem aumento previo).
+ * Encoder: giro troca menu; clique zera a estimativa de consumo medio.
+ * Segurar encoder alterna ajuste de relogio: giro ajusta minutos; botao cruise
+ * ajusta horas. Relogio manual inicia em 00:00:00; nao mantido sem energia.
+ * Consumo ESTIMADO: queda do nivel do tanque desde o reset; nao e vazao real.
+ * Ajustar TANK_L e calibracao ADC. Reabastecimento reinicia a estimativa.
+ * Relogio manual: ajustar na IHM; sem RTC externo/SNTP ou persistencia.
+ * Mute silencia sons, preservando avisos visuais. Metricas sao volateis.
+ * Testes de logica: gcc -x c -DCLUSTER_HOST_TEST codigotxt.txt -lm -o /tmp/cluster-test
+ */
 #include <stdbool.h>
 #include <stdint.h>
-#include "driver/adc.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#define CAN_TIMEOUT_US 500000LL
+#define TANK_L 50.0f
+#define ADC_EMPTY 0
+#define ADC_FULL 4095
+#define LONG_US 1000000LL
+
+/* PERFIL CAN EDITAVEL. IDs sao identificadores de mensagem, nao destinos.
+ * Hipoteses: RX 0x100/0x200; TX 0x310, DLC2, 500kbit/s, periodo100ms.
+ * Para sinais DBC: start=bit inicial DBC; bits=largura (1..16);
+ * motorola=false Intel @1; true Motorola @0; signed_value=true para '-'.
+ * Valor fisico = valor bruto * factor + offset. Confirmar cada campo.
+ * BENCH_MODE=1 permite testar botoes/cruise sem receber velocidade.
+ * Isso nao gera ACK: outro no CAN ativo ainda precisa reconhecer os quadros.
+ */
+#ifndef CLUSTER_TX_ID
+#define CLUSTER_TX_ID 0x310U
+#endif
+#ifndef CLUSTER_SPEED_RX_ID
+#define CLUSTER_SPEED_RX_ID 0x100U
+#endif
+#ifndef CLUSTER_BODY_RX_ID
+#define CLUSTER_BODY_RX_ID 0x200U
+#endif
+#ifndef CLUSTER_TX_DLC
+#define CLUSTER_TX_DLC 2
+#endif
+#ifndef CLUSTER_CAN_BITRATE
+#define CLUSTER_CAN_BITRATE 500000
+#endif
+#ifndef CLUSTER_TX_PERIOD_MS
+#define CLUSTER_TX_PERIOD_MS 100
+#endif
+#ifndef CLUSTER_BENCH_MODE
+#define CLUSTER_BENCH_MODE 0
+#endif
+#if CLUSTER_TX_DLC < 1 || CLUSTER_TX_DLC > 8 || CLUSTER_TX_ID > 0x7ff || CLUSTER_SPEED_RX_ID > 0x7ff || CLUSTER_BODY_RX_ID > 0x7ff || CLUSTER_TX_PERIOD_MS < 1
+#error "Perfil requer CAN classico padrao: IDs 11 bits, DLC1..8 e periodo positivo"
+#endif
+
+typedef struct {
+    unsigned start, bits;
+    bool motorola, signed_value;
+    double factor, offset;
+} CanSignal;
+static const CanSignal sig_temperature = {0,8,false,false,1,0};
+static const CanSignal sig_speed = {8,8,false,false,1,0};
+static const CanSignal sig_left = {5,1,false,false,1,0};
+static const CanSignal sig_right = {6,1,false,false,1,0};
+static const CanSignal sig_cruise_speed = {0,8,false,false,1,0};
+static const CanSignal sig_cruise_active = {8,8,false,false,1,0};
+
+static bool signal_positions(CanSignal sig, unsigned len, unsigned positions[16]) {
+    if (!len || len>8 || !sig.bits || sig.bits>16 ||
+        !isfinite(sig.factor) || sig.factor==0 || !isfinite(sig.offset)) return false;
+    unsigned pos=sig.start;
+    for (unsigned i=0;i<sig.bits;i++) {
+        if (pos>=len*8) return false;
+        positions[i]=pos;
+        pos=sig.motorola ? (pos%8==0 ? pos+15 : pos-1) : pos+1;
+    }
+    return true;
+}
+static bool signal_read(const uint8_t *data, unsigned len, CanSignal sig, double *value) {
+    unsigned positions[16]; uint32_t raw=0;
+    if (!signal_positions(sig,len,positions)) return false;
+    for (unsigned i=0;i<sig.bits;i++) {
+        unsigned bit=sig.motorola ? sig.bits-1-i : i;
+        raw|=((data[positions[i]/8]>>(positions[i]%8))&1U)<<bit;
+    }
+    int32_t integer=(int32_t)raw;
+    if (sig.signed_value && (raw&(1U<<(sig.bits-1)))) integer-=(1U<<sig.bits);
+    *value=integer*sig.factor+sig.offset;
+    return isfinite(*value);
+}
+static bool signal_write(uint8_t *data, unsigned len, CanSignal sig, double value) {
+    unsigned positions[16];
+    if (!signal_positions(sig,len,positions) || !isfinite(value)) return false;
+    double raw=round((value-sig.offset)/sig.factor);
+    double min=sig.signed_value ? -(double)(1U<<(sig.bits-1)) : 0;
+    double max=sig.signed_value ? (1U<<(sig.bits-1))-1 : (1U<<sig.bits)-1;
+    if (!isfinite(raw) || raw<min || raw>max) return false;
+    uint32_t integer=(uint32_t)(int32_t)raw & ((1U<<sig.bits)-1);
+    for (unsigned i=0;i<sig.bits;i++) {
+        unsigned bit=sig.motorola ? sig.bits-1-i : i;
+        uint8_t mask=1U<<(positions[i]%8);
+        if (integer&(1U<<bit)) data[positions[i]/8]|=mask;
+        else data[positions[i]/8]&=(uint8_t)~mask;
+    }
+    return true;
+}
+static bool cruise_payload(uint8_t *data, unsigned len, double speed, bool active) {
+    if (!len || len>8) return false;
+    memset(data,0,len);
+    unsigned a[16], b[16];
+    if (!signal_positions(sig_cruise_speed,len,a) || !signal_positions(sig_cruise_active,len,b)) return false;
+    for (unsigned i=0;i<sig_cruise_speed.bits;i++)
+        for (unsigned j=0;j<sig_cruise_active.bits;j++) if (a[i]==b[j]) return false;
+    return signal_write(data,len,sig_cruise_speed,speed) &&
+           signal_write(data,len,sig_cruise_active,active ? 1 : 0);
+}
+
+typedef struct {
+    bool pcm, bcm, cruise, mute, reserve, adc_ok, tx_error;
+    float speed, temperature;
+    uint8_t setpoint, arrows;
+    int menu, trip_selected;
+    int64_t pcm_at, bcm_at, tick_at, beep_until;
+    double trip[2], consumption_km;
+    float fuel, brightness, baseline_fuel, minimum_fuel, consumed_l;
+    bool consumption_ready, clock_setting;
+    int64_t clock_offset;
+} Model;
+
+static Model m = {.setpoint = 50}; /* So a tarefa controller modifica este estado. */
+static float clamp(float x, float lo, float hi) { return fminf(hi, fmaxf(lo, x)); }
+static void beep(int64_t now, int ms) {
+    if (!m.mute && now + ms * 1000LL > m.beep_until)
+        m.beep_until = now + ms * 1000LL;
+}
+static void reset_consumption(void) {
+    m.consumption_km = 0;
+    m.consumed_l = 0;
+    m.baseline_fuel = m.fuel; m.minimum_fuel = m.fuel;
+    m.consumption_ready = m.adc_ok;
+}
+static void fuel_sample(float fuel, float brightness, int64_t now) {
+    m.fuel = clamp(fuel, 0, 100);
+    m.brightness = clamp(brightness, 0, 100);
+    m.adc_ok = true;
+    if (!m.consumption_ready) reset_consumption();
+    /* Histerese de 5 pontos para detectar reabastecimento, nao ruido do ADC. */
+    if (m.fuel > m.minimum_fuel + 5) reset_consumption();
+    if (m.fuel < m.minimum_fuel) m.minimum_fuel = m.fuel;
+    float used = (m.baseline_fuel - m.fuel) * TANK_L / 100;
+    if (used > m.consumed_l) m.consumed_l = used;
+    if (m.fuel < 10) m.reserve = true;
+    else if (m.fuel > 11) m.reserve = false;
+    if (m.reserve) beep(now, 120);
+}
+static void advance(int64_t now) {
+    if (now < m.tick_at) now = m.tick_at; /* Nunca retrocede ao drenar RX antigo. */
+    if (m.tick_at && m.pcm) {
+        int64_t end = now < m.pcm_at + CAN_TIMEOUT_US ? now : m.pcm_at + CAN_TIMEOUT_US;
+        if (end > m.tick_at) {
+            double km = m.speed * (end - m.tick_at) / 3600000000.0;
+            m.trip[0] += km; m.trip[1] += km; m.consumption_km += km;
+        }
+    }
+    m.tick_at = now;
+    if (m.pcm && now - m.pcm_at >= CAN_TIMEOUT_US) {
+        m.pcm = false; m.speed = 0; m.cruise = false;
+        beep(now, 200);
+    }
+    if (m.bcm && now - m.bcm_at >= CAN_TIMEOUT_US) {
+        m.bcm = false; m.arrows = 0; beep(now, 200);
+    }
+}
+static void receive(uint32_t id, const uint8_t *data, unsigned len,
+                    bool extended, bool rtr, bool fd, int64_t now) {
+    advance(now); /* Integra a velocidade anterior antes de receber uma nova. */
+    if (extended || rtr || fd) return;
+    double speed, temperature, left, right;
+    if (id == CLUSTER_SPEED_RX_ID && signal_read(data,len,sig_speed,&speed) &&
+        signal_read(data,len,sig_temperature,&temperature) && speed>=0 && speed<=400 &&
+        temperature>=-100 && temperature<=250) {
+        m.temperature=(float)temperature; m.speed=(float)speed;
+        m.pcm_at=now; m.pcm=true;
+    } else if (id == CLUSTER_BODY_RX_ID && signal_read(data,len,sig_left,&left) &&
+               signal_read(data,len,sig_right,&right) && (left==0 || left==1) && (right==0 || right==1)) {
+        m.arrows=(left==1 ? 1 : 0)|(right==1 ? 2 : 0); m.bcm_at=now; m.bcm=true;
+    }
+}
+/* Botoes e encoder possuem debounce de 30 ms e apenas um evento por pressao. */
+typedef struct { bool raw, stable, long_sent; int64_t changed, pressed; } Button;
+enum { NONE, SHORT, LONG };
+static int button_update(Button *b, bool down, int64_t now) {
+    if (down != b->raw) { b->raw = down; b->changed = now; }
+    if (b->stable != b->raw && now - b->changed >= 30000) {
+        b->stable = b->raw;
+        if (b->stable) { b->pressed = now; b->long_sent = false; }
+        else if (!b->long_sent) return SHORT;
+    }
+    if (b->stable && b->raw && !b->long_sent && now - b->pressed >= LONG_US) {
+        b->long_sent = true; return LONG;
+    }
+    return NONE;
+}
+static void action(int button, int event, int64_t now) {
+    if (!event) return;
+    if (button == 1 && m.clock_setting) {
+        m.clock_offset += event == SHORT ? 3600 : -3600;
+    } else if (button == 0) {
+        if (event == SHORT) m.trip_selected ^= 1;
+        else m.trip[m.trip_selected] = 0;
+    } else if (button == 1) {
+        if ((m.pcm || CLUSTER_BENCH_MODE) && !m.tx_error) m.cruise = !m.cruise;
+    } else if (button == 2) {
+        if (m.cruise) m.setpoint = (uint8_t)clamp(m.setpoint + (event == SHORT ? 5 : -5), 0, 180);
+    } else if (button == 3) {
+        m.mute = !m.mute;
+        if (m.mute) m.beep_until = 0;
+    } else if (button == 4) {
+        if (event == LONG) m.clock_setting = !m.clock_setting;
+        else if (!m.clock_setting) reset_consumption();
+    }
+    beep(now, 70);
+}
+
+#ifdef CLUSTER_HOST_TEST
+#include <assert.h>
+int main(void) {
+    uint8_t pcm[] = {90, 72}, bcm[] = {0x60};
+    receive(CLUSTER_SPEED_RX_ID, pcm, 2, false, false, false, 1000000);
+    advance(1250000);
+    assert(fabs(m.trip[0] - 0.005) < 0.000001);
+    receive(CLUSTER_SPEED_RX_ID, pcm, 2, false, false, false, 1250000);
+    action(1, SHORT, 1250000); assert(m.cruise);
+    action(2, LONG, 1250000); assert(m.setpoint == 45);
+    receive(CLUSTER_BODY_RX_ID, bcm, 1, false, false, false, 1250000);
+    assert(m.arrows == 3);
+    advance(2000000); assert(!m.pcm && !m.bcm && !m.cruise && m.arrows == 0);
+    assert(fabs(m.trip[0] - 0.015) < 0.000001); /* Nao integra alem do timeout. */
+    double saved = m.trip[0]; advance(3000000); assert(m.trip[0] == saved);
+    action(0, SHORT, 3000000); action(0, LONG, 3000000);
+    assert(m.trip[1] == 0 && m.trip[0] == saved);
+    fuel_sample(50, 60, 3000000); fuel_sample(48, 60, 3500000);
+    assert(fabsf(m.consumed_l - 1) < 0.001);
+    action(4, SHORT, 3500000); assert(m.consumed_l == 0 && m.consumption_km == 0);
+    fuel_sample(9, 60, 4000000); assert(m.reserve);
+    action(3, SHORT, 4000000); assert(m.mute && m.beep_until == 0);
+    fuel_sample(10.5f, 60, 4500000); assert(m.reserve && m.beep_until == 0);
+    fuel_sample(12, 60, 5000000); assert(!m.reserve);
+    receive(CLUSTER_SPEED_RX_ID, pcm, 1, false, false, false, 5100000); assert(!m.pcm);
+    receive(CLUSTER_SPEED_RX_ID, pcm, 2, false, true, false, 5200000); assert(!m.pcm);
+    Button b = {0};
+    assert(button_update(&b, true, 6000000) == NONE);
+    assert(button_update(&b, false, 6010000) == NONE); /* Bounce. */
+    assert(button_update(&b, true, 6020000) == NONE);
+    assert(button_update(&b, true, 6050000) == NONE);
+    assert(button_update(&b, true, 7050000) == LONG);
+    assert(button_update(&b, true, 8050000) == NONE);
+    assert(button_update(&b, false, 8060000) == NONE);
+    assert(button_update(&b, false, 8090000) == NONE); /* Nao gera SHORT depois de LONG. */
+    b = (Button){0};
+    button_update(&b, true, 9000000); button_update(&b, true, 9030000);
+    button_update(&b, false, 9100000);
+    assert(button_update(&b, false, 9130000) == SHORT);
+    fuel_sample(30, 60, 9150000); assert(m.consumed_l == 0); /* Reabastecimento parcial. */
+    int64_t tick_saved=m.tick_at; advance(tick_saved-1000); assert(m.tick_at == tick_saved);
+    action(4, LONG, 9200000); assert(m.clock_setting);
+    action(1, SHORT, 9200000); assert(m.clock_offset == 3600);
+    action(1, LONG, 9200000); assert(m.clock_offset == 0);
+    action(4, LONG, 9200000); assert(!m.clock_setting);
+    uint8_t payload[8]; double value;
+    assert(cruise_payload(payload,CLUSTER_TX_DLC,50,true));
+    assert(payload[0]==50 && payload[1]==1);
+    assert(!cruise_payload(payload,1,50,true));
+    CanSignal little={0,16,false,false,0.1,-40};
+    uint8_t known_le[]={0x34,0x12};
+    assert(signal_read(known_le,2,little,&value) && fabs(value-426.0)<0.00001);
+    CanSignal big={7,16,true,false,1,0};
+    uint8_t known_be[]={0x12,0x34};
+    assert(signal_read(known_be,2,big,&value) && value==4660);
+    memset(payload,0,sizeof(payload));
+    assert(signal_write(payload,8,big,4660) && payload[0]==0x12 && payload[1]==0x34);
+    CanSignal signed_signal={0,8,false,true,0.5,-10};
+    uint8_t minus[]={0xfc};
+    assert(signal_read(minus,1,signed_signal,&value) && value==-12);
+    assert(signal_write(payload,1,signed_signal,-12) && payload[0]==0xfc);
+    assert(!signal_write(payload,1,signed_signal,200));
+    assert(!signal_read(known_be,1,big,&value));
+    CanSignal crossing={4,12,false,false,1,0};
+    uint8_t known_cross[]={0xc0,0xab};
+    assert(signal_read(known_cross,2,crossing,&value) && value==0xabc);
+    puts("PASS: integracao/timeout CAN, cruise, trip A/B, consumo, reserva, mute, debounce.");
+    return 0;
+}
+#else
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
-#include "ssd1306.h"
-#include <string.h>
-#include "driver/twai.h"
+#include "driver/i2c_master.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_twai.h"
+#include "esp_twai_onchip.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_check.h"
+#include "esp_idf_version.h"
 
-#define BUZZER_pino 23
-#define bttn_R 32
-#define bttn_Cruise 33
-#define bttn_VPIloto 18
-#define bttn_mute 19 
-#define ENCODER_CLK 25
-#define ENCODER_DT  26
-#define ENCODER_SW  27
-#define LED1 5
-#define LED2 4
-#define LED3 2
-#define LED4 14
-#define LED5 12
-#define LED6 13
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
+#error "Requer ESP-IDF 5.5 ou superior"
+#endif
+#ifndef CONFIG_IDF_TARGET_ESP32
+#error "Este mapeamento de GPIO/ADC e especifico do ESP32 classico"
+#endif
 
+static const char *TAG = "cluster";
+static const int led_pins[] = {5,4,2,14,12,13};
+static const int button_pins[] = {32,33,18,19,27};
+static QueueHandle_t rx_queue, tx_results;
+static adc_oneshot_unit_handle_t adc;
+static i2c_master_dev_handle_t oled;
+static twai_node_handle_t can;
+/* Buffer TX persistente: driver moderno nao copia o quadro/payload. */
+static uint8_t tx_payload[CLUSTER_TX_DLC];
+static twai_frame_t tx_frame = {.header = {.id = CLUSTER_TX_ID, .dlc = CLUSTER_TX_DLC},
+                               .buffer = tx_payload, .buffer_len = CLUSTER_TX_DLC};
+static bool tx_pending;
+static int64_t tx_at;
+typedef struct { uint32_t id; uint8_t data[8], len; int64_t at; } Rx;
 
-#define CAN_ID_ECM             0x100
-#define CAN_ID_BCM             0x200
-#define CAN_ID_CRUISE_TX       0x300  // Cruise enviado pelo Cluster
-#define BUZZER_PULSE_MS        200
-#define CAN_TIMEOUT_US         500000
-#define ADC_AMOSTRAS           16
-
-
-/*QueueHandle_t filaCombustivel;
-QueueHandle_t filaIluminacao;*/
-QueueHandle_t filaBttn;
-QueueHandle_t filaCAN;
-
-typedef struct {
-    int bttn;
-} eventBttn;
-
-typedef struct {
-    float velocidade;
-    bool setaEsquerda;
-    bool setaDireita;
-    float temperatura;
-} dadosCAN;
-
-const char *menus[] = {
-    "Menu 1: Conducao",
-    "Menu 2: Carroceria",
-    "Menu 3: Diagnostico OBD-II"
-};
-
-SSD1306_t Oled;
-volatile int menuAtual = 0;
-volatile float nivelCombustivelAtual = 0;
-volatile float nivelIluminacaoAtual = 0;
-volatile bool pcmOnline = false;
-volatile bool bcmOnline = false;
-volatile bool Mute = false;
-int64_t ultimoPCM = 0;
-int64_t ultimoBCM = 0;
-const int barra[6] = {LED1, LED2, LED3, LED4, LED5, LED6};
-
-void iniciarSistema(void);
-
-void task_oled(void *pvParameter);
-void task_encoder(void *pvParameterEncoder);
-void task_bttn(void *pvParameterBttn);
-void task_potenciometroIluminacao(void *pvParameterIlu);
-void task_potenciometroCombustivel(void *pvParameterComb);
-void task_can_rx(void *pvParameter);
-void task_can_timeout(void *pvParameter);
-void task_buzzer(void *pvParameter);
-void atualizarBarra(float velocidade);
-
-static void solicitarBuzzer(uint32_t duracao_ms);
-static void pararBuzzer(void);
-static uint8_t lerSinalIntel(const uint8_t *dados, uint8_t inicio, uint8_t tamanho);
-static void oled_renderizar(const char linhas[8][17]);
-static int lerADCMedio(adc1_channel_t canal);
-static float filtrarADC(float valor, float *estado);
-
-void app_main(void){
-    iniciarSistema();
-    xTaskCreate(&task_potenciometroCombustivel, "task_potComb", 2048, NULL, 4, NULL);
-    xTaskCreate(&task_potenciometroIluminacao, "task_potIlu", 2048, NULL, 3, NULL);
-    xTaskCreate(&task_encoder, "task_encoder", 4096, NULL, 5, NULL);
-    xTaskCreate(&task_oled, "task_oled", 4096, NULL, 6, NULL);
-    xTaskCreate(&task_bttn, "task_bttn", 2048, NULL, 7, NULL);
-    xTaskCreate(&task_can_rx, "task_can_rx", 2048, NULL, 9, NULL);
-    xTaskCreate(&task_can_timeout, "CAN Timeout", 2048, NULL, 10, NULL);
-    xTaskCreate(&task_buzzer, "task_buzzer", 2048, NULL, 8, NULL);
-}
-volatile int64_t buzzerAte = 0;
-portMUX_TYPE buzzerMux = portMUX_INITIALIZER_UNLOCKED;
-
-void atualizarBarra(float velocidade){
-    int ledsAcesos = (int)(velocidade / 25.0f);
-    if (ledsAcesos < 0)
-        ledsAcesos = 0;
-    if (ledsAcesos > 6)
-        ledsAcesos = 6;
-    for(int i = 0; i < 6; i++){
-        gpio_set_level(barra[i], i < ledsAcesos);
+static bool on_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *event, void *ctx) {
+    (void)event; (void)ctx;
+    Rx rx = {0};
+    twai_frame_t frame = {.buffer = rx.data, .buffer_len = sizeof(rx.data)};
+    BaseType_t wake = pdFALSE;
+    if (twai_node_receive_from_isr(node, &frame) == ESP_OK &&
+        !frame.header.ide && !frame.header.rtr && !frame.header.fdf &&
+        frame.header.dlc <= 8) {
+        rx.id = frame.header.id; rx.len = frame.header.dlc; rx.at = esp_timer_get_time();
+        xQueueSendFromISR(rx_queue, &rx, &wake);
     }
+    return wake == pdTRUE;
 }
-
-static void solicitarBuzzer(uint32_t duracao_ms)
-{
-    if (Mute) {
-        return;
-    }
-
-    int64_t novoFim = esp_timer_get_time() + ((int64_t)duracao_ms * 1000);
-    portENTER_CRITICAL(&buzzerMux);
-    if (novoFim > buzzerAte) {
-        buzzerAte = novoFim;
-    }
-    portEXIT_CRITICAL(&buzzerMux);
+static bool on_tx(twai_node_handle_t node, const twai_tx_done_event_data_t *event, void *ctx) {
+    (void)node; (void)ctx;
+    BaseType_t wake = pdFALSE;
+    bool success = event->is_tx_success;
+    xQueueOverwriteFromISR(tx_results, &success, &wake);
+    return wake == pdTRUE;
 }
-
-static void pararBuzzer(void)
-{
-    portENTER_CRITICAL(&buzzerMux);
-    buzzerAte = 0;
-    portEXIT_CRITICAL(&buzzerMux);
+/* Fonte 5x7 propria: A-Z, 0-9 e pontuacao. Texto sempre em maiusculas. */
+static const uint8_t letters[26][5] = {
+ {126,17,17,17,126},{127,73,73,73,54},{62,65,65,65,34},{127,65,65,34,28},
+ {127,73,73,73,65},{127,9,9,9,1},{62,65,73,73,122},{127,8,8,8,127},
+ {0,65,127,65,0},{32,64,65,63,1},{127,8,20,34,65},{127,64,64,64,64},
+ {127,2,12,2,127},{127,4,8,16,127},{62,65,65,65,62},{127,9,9,9,6},
+ {62,65,81,33,94},{127,9,25,41,70},{70,73,73,73,49},{1,1,127,1,1},
+ {63,64,64,64,63},{31,32,64,32,31},{63,64,56,64,63},{99,20,8,20,99},
+ {7,8,112,8,7},{97,81,73,69,67}};
+static const uint8_t digits[10][5] = {
+ {62,81,73,69,62},{0,66,127,64,0},{66,97,81,73,70},{33,65,73,77,51},
+ {24,20,18,127,16},{39,69,69,69,57},{60,74,73,73,48},{1,113,9,5,3},
+ {54,73,73,73,54},{6,73,73,41,30}};
+static void glyph(char c, uint8_t *out) {
+    memset(out, 0, 5);
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c >= 'A' && c <= 'Z') memcpy(out, letters[c-'A'], 5);
+    else if (c >= '0' && c <= '9') memcpy(out, digits[c-'0'], 5);
+    else if (c == ':') out[2] = 0x36;
+    else if (c == '.') out[2] = 0x60;
+    else if (c == '-') memset(out, 8, 5);
+    else if (c == '/') { out[0]=32;out[1]=16;out[2]=8;out[3]=4;out[4]=2; }
+    else if (c == '%') { out[0]=99;out[1]=19;out[2]=8;out[3]=100;out[4]=99; }
+    else if (c == '<') { out[1]=8;out[2]=20;out[3]=34; }
+    else if (c == '>') { out[1]=34;out[2]=20;out[3]=8; }
 }
-
-static uint8_t lerSinalIntel(const uint8_t *dados, uint8_t inicio, uint8_t tamanho)
-{
-    uint8_t byte = inicio / 8;
-    uint8_t deslocamento = inicio % 8;
-    uint16_t mascara = (uint16_t)((1U << tamanho) - 1U);
-    return (uint8_t)((dados[byte] >> deslocamento) & mascara);
+static esp_err_t oled_commands(const uint8_t *cmd, size_t len) {
+    uint8_t packet[32] = {0};
+    if (len > sizeof(packet)-1) return ESP_ERR_INVALID_SIZE;
+    memcpy(packet+1, cmd, len);
+    return i2c_master_transmit(oled, packet, len+1, 50);
 }
-
-static int lerADCMedio(adc1_channel_t canal)
-{
-    int soma = 0;
-    for (int i = 0; i < ADC_AMOSTRAS; i++) {
-        soma += adc1_get_raw(canal);
-    }
-    return soma / ADC_AMOSTRAS;
-}
-
-static float filtrarADC(float valor, float *estado)
-{
-    if (*estado < 0.0f) {
-        *estado = valor;
+static void render(int64_t now) {
+    char lines[8][22] = {{0}};
+    int64_t seconds = (now/1000000 + m.clock_offset) % 86400;
+    if (seconds < 0) seconds += 86400;
+    unsigned s = (unsigned)seconds;
+    snprintf(lines[0], 22, "RELOGIO %02u:%02u:%02u", s/3600, s/60%60, s%60);
+    if (m.clock_setting) {
+        strcpy(lines[1], "AJUSTAR RELOGIO");
+        strcpy(lines[2], "ENCODER: MINUTOS");
+        strcpy(lines[3], "CRUISE: HORA +");
+        strcpy(lines[4], "CRUISE LONGO: HORA -");
+        strcpy(lines[5], "ENCODER LONGO: SAIR");
+    } else if (m.menu == 0) {
+        strcpy(lines[1], "CONDUCAO");
+        if (m.pcm) snprintf(lines[2], 22, "VEL %.0f KM/H T %.0f C", m.speed, m.temperature);
+        else strcpy(lines[2], "VEL --  TEMP --");
+        snprintf(lines[3], 22, "TRIP %c %.2f KM", 'A'+m.trip_selected, m.trip[m.trip_selected]);
+        if (m.adc_ok) snprintf(lines[4], 22, "COMB %.0f%% BR %.0f%%", m.fuel, m.brightness);
+        else strcpy(lines[4], "FALHA ADC");
+        if (m.consumed_l >= 0.1f && m.consumption_km > 0)
+            snprintf(lines[5], 22, "EST %.1f KM/L", m.consumption_km/m.consumed_l);
+        else strcpy(lines[5], "EST CONSUMO -- KM/L");
+        snprintf(lines[6], 22, "CRUISE %s %u KM/H", m.cruise ? "ON" : "OFF", m.setpoint);
+    } else if (m.menu == 1) {
+        strcpy(lines[1], "CARROCERIA");
+        snprintf(lines[2], 22, "%s    %s", m.bcm && (m.arrows&1) ? "<- SETA" : "--", m.bcm && (m.arrows&2) ? "SETA ->" : "--");
+        snprintf(lines[3], 22, "BCM %s", m.bcm ? "ONLINE" : "SEM SINAL");
+        snprintf(lines[4], 22, "BRILHO %.0f%%", m.brightness);
+        snprintf(lines[5], 22, "ALARME %s", m.mute ? "MUDO" : "ATIVO");
     } else {
-        *estado = (*estado * 0.75f) + (valor * 0.25f);
+        strcpy(lines[1], "DIAGNOSTICO OBD-II");
+        snprintf(lines[2], 22, "PCM %s", m.pcm ? "ONLINE" : "SEM SINAL");
+        snprintf(lines[3], 22, "BCM %s", m.bcm ? "ONLINE" : "SEM SINAL");
+        if (m.pcm) snprintf(lines[4], 22, "TEMP MOTOR %.1f C", m.temperature);
+        else strcpy(lines[4], "TEMP MOTOR --");
+        snprintf(lines[5], 22, "CAN TX %s", m.tx_error ? "FALHA" : "OK");
+        strcpy(lines[6], "DTC: NAO DISPONIVEL"); /* PDF nao define servicos OBD/UDS. */
     }
-    return *estado;
-}
-
-void task_buzzer(void *pvParameter)
-{
-    bool estadoAnterior = false;
-
-    while (1) {
-        int64_t agora = esp_timer_get_time();
-        int64_t fim;
-        bool mutado = Mute;
-
-        portENTER_CRITICAL(&buzzerMux);
-        fim = buzzerAte;
-        portEXIT_CRITICAL(&buzzerMux);
-
-        bool deveLigar = !mutado && agora < fim;
-        if (deveLigar != estadoAnterior) {
-            ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0,
-                          deveLigar ? 512 : 0);
-            ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
-            estadoAnterior = deveLigar;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+    snprintf(lines[7], 22, "%s%s%s", m.reserve ? "RESERVA " : "",
+             (!m.pcm || !m.bcm) ? "CAN! " : "", m.mute ? "MUTE" : "");
+    static uint8_t previous[8][128]; static bool valid[8];
+    for (int page=0; page<8; page++) {
+        uint8_t packet[129] = {0x40};
+        for (size_t col=0; col<strlen(lines[page]) && col<21; col++)
+            glyph(lines[page][col], packet+1+col*6);
+        if (valid[page] && memcmp(previous[page], packet+1, 128)==0) continue;
+        uint8_t pos[] = {(uint8_t)(0xb0+page), 0x00, 0x10};
+        esp_err_t err = oled_commands(pos, sizeof(pos));
+        if (err == ESP_OK) err = i2c_master_transmit(oled, packet, sizeof(packet), 50);
+        if (err != ESP_OK) { ESP_LOGW(TAG, "OLED: %s", esp_err_to_name(err)); continue; }
+        memcpy(previous[page], packet+1, 128); valid[page]=true;
     }
 }
-
-void enviarCruiseCAN(int velocidade, bool ativo)
-{
-    twai_message_t msg = {
-        .identifier = CAN_ID_CRUISE_TX,
-        .data_length_code = 2,
-        .flags = 0
-    };
-    msg.data[0] = (uint8_t)velocidade;
-    msg.data[1] = ativo ? 0x01 : 0x00;
-    esp_err_t erro = twai_transmit(&msg, pdMS_TO_TICKS(100));
-    if (erro != ESP_OK) {
-        printf("Erro ao transmitir cruise: %s\n", esp_err_to_name(erro));
+static void transmit(int64_t now) {
+    if (tx_pending) {
+        esp_err_t done = twai_node_transmit_wait_all_done(can, 0);
+        if (done != ESP_OK) { if (now-tx_at > CAN_TIMEOUT_US) { m.tx_error=true; m.cruise=false; } return; }
+        bool success = false;
+        if (xQueueReceive(tx_results, &success, 0) != pdTRUE) return;
+        m.tx_error = !success;
+        if (!success) m.cruise = false;
+        tx_pending = false;
     }
+    if (now-tx_at < CLUSTER_TX_PERIOD_MS*1000LL) return;
+    if (!cruise_payload(tx_payload,sizeof(tx_payload),m.setpoint,m.cruise)) {
+        m.tx_error=true;m.cruise=false;tx_at=now;
+        ESP_LOGE(TAG,"Perfil TX invalido: bits/DLC/escala");return;
+    }
+    esp_err_t err = twai_node_transmit(can, &tx_frame, 0);
+    tx_at = now; tx_pending = err == ESP_OK;
+    if (err != ESP_OK) { m.tx_error = true; m.cruise = false; }
 }
-
-static void oled_renderizar(const char linhas[8][17])
-{
-    static char linhasAnteriores[8][17];
-    static bool inicializado = false;
-    bool mudou = !inicializado;
-    char linhasNormalizadas[8][17];
-
-    for (int page = 0; page < 8; page++) {
-        memset(linhasNormalizadas[page], ' ', sizeof(linhasNormalizadas[page]) - 1);
-        linhasNormalizadas[page][sizeof(linhasNormalizadas[page]) - 1] = '\0';
-
-        size_t tamanho = strlen(linhas[page]);
-        if (tamanho > sizeof(linhasNormalizadas[page]) - 1) {
-            tamanho = sizeof(linhasNormalizadas[page]) - 1;
-        }
-        memcpy(linhasNormalizadas[page], linhas[page], tamanho);
-
-        if (!inicializado && strncmp(linhasNormalizadas[page], linhasAnteriores[page],
-                                     sizeof(linhasNormalizadas[page])) != 0) {
-            mudou = true;
-        }
-        if (inicializado && strncmp(linhasNormalizadas[page], linhasAnteriores[page],
-                                    sizeof(linhasNormalizadas[page])) != 0) {
-            mudou = true;
-        }
-    }
-
-    if (!mudou) {
-        return;
-    }
-
-    for (int page = 0; page < 8; page++) {
-        ssd1306_set_text(&Oled, page, linhasNormalizadas[page], 16, false);
-        memcpy(linhasAnteriores[page], linhasNormalizadas[page],
-               sizeof(linhasNormalizadas[page]));
-    }
-
-    ssd1306_show_buffer(&Oled);
-    inicializado = true;
-}
-
-void task_can_timeout(void *pvParameter)
-{
-    while (1){
-        int64_t agora = esp_timer_get_time();
-        if (pcmOnline && (agora - ultimoPCM) > CAN_TIMEOUT_US){
-            pcmOnline = false;
-            printf("TIMEOUT: PCM desconectada!\n");
-        }
-        if (bcmOnline && (agora - ultimoBCM) > CAN_TIMEOUT_US){
-            bcmOnline = false;
-            printf("TIMEOUT: BCM desconectada!\n");
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-void task_can_rx(void *pvParameter)
-{
-    twai_message_t rx_msg;
-    dadosCAN dados = {
-        .velocidade = 0,
-        .setaEsquerda = false,
-        .setaDireita = false,
-        .temperatura = 0
-    };
-    while (1) {
-        if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
-            solicitarBuzzer(BUZZER_PULSE_MS);
-
-            switch (rx_msg.identifier) {
-                case CAN_ID_BCM: // BCM: Seta_E_D = bits 5..6 do byte 0
-                    if (rx_msg.data_length_code >= 1) {
-                        ultimoBCM = esp_timer_get_time();
-                        bcmOnline = true;
-                        uint8_t seta = lerSinalIntel(rx_msg.data, 5, 2);
-                        dados.setaEsquerda = seta == 1 || seta == 3;
-                        dados.setaDireita = seta == 2 || seta == 3;
-                    }
-                    break;
-                case CAN_ID_ECM: // ECM/PCM: Temp_Motor byte 0, Velocidade byte 1
-                    if (rx_msg.data_length_code >= 2) {
-                        ultimoPCM = esp_timer_get_time();
-                        pcmOnline = true;
-                        dados.temperatura = lerSinalIntel(rx_msg.data, 0, 8);
-                        dados.velocidade = lerSinalIntel(rx_msg.data, 8, 8);
-                        atualizarBarra(dados.velocidade);
-                    }
-                    break;
+static void controller(void *arg) {
+    (void)arg;
+    Button buttons[5] = {0};
+    int old_ab = (gpio_get_level(25)<<1)|gpio_get_level(26), steps=0;
+    const int8_t quadrature[16] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+    int64_t adc_at=0, screen_at=0, recovery_at=0, unknown_at=-1000000;
+    float filtered_fuel=-1, filtered_brightness=-1;
+    int old_contrast=-1;
+    TickType_t tick = xTaskGetTickCount();
+    for (;;) {
+        Rx rx;
+        for (int count=0;count<64 && xQueueReceive(rx_queue,&rx,0)==pdTRUE;count++) {
+            receive(rx.id,rx.data,rx.len,false,false,false,rx.at);
+            if (rx.id!=CLUSTER_SPEED_RX_ID && rx.id!=CLUSTER_BODY_RX_ID && rx.at-unknown_at>=1000000) {
+                unknown_at=rx.at;
+                ESP_LOGI(TAG,"RX sem mapa ID=0x%03lx DLC=%u",(unsigned long)rx.id,rx.len);
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG,rx.data,rx.len,ESP_LOG_INFO);
             }
-
-            printf("CAN RX ID=0x%03lx DLC=%d\n",
-                   (unsigned long)rx_msg.identifier,
-                   rx_msg.data_length_code);
-            xQueueOverwrite(filaCAN, &dados);
         }
-    }
-}
-
-void task_oled(void *pvParameter) {
-    eventBttn evento;
-    dadosCAN dados = {
-        .velocidade = 0,
-        .setaEsquerda = false,
-        .setaDireita = false,
-        .temperatura = 0
-    };
-    char mensagem[24] = "";
-    int64_t mensagemAte = 0;
-    bool cruiseAtivo = false;
-    int velocidadePiloto = 50;
-
-    while(1) {
-        if (xQueueReceive(filaCAN, &dados, 0)) {
+        int64_t now = esp_timer_get_time(); advance(now);
+        for (int i=0;i<5;i++) action(i, button_update(&buttons[i], !gpio_get_level(button_pins[i]), now), now);
+        int ab = (gpio_get_level(25)<<1)|gpio_get_level(26);
+        if ((old_ab^ab)==3) steps=0; /* Transicao impossivel: descarta salto. */
+        else steps += quadrature[(old_ab<<2)|ab];
+        old_ab=ab;
+        if (steps>=4 || steps<=-4) {
+            if (m.clock_setting) {
+                m.clock_offset += steps>0 ? 60 : -60;
+            } else m.menu=(m.menu+(steps>0 ? 1 : 2))%3;
+            steps=0; beep(now,50);
         }
-        if (xQueueReceive(filaBttn, &evento, pdMS_TO_TICKS(20))) {
-            switch(evento.bttn) {
-                case 1: strcpy(mensagem, "! Trip Reset"); break;
-                case 2:
-                    strcpy(mensagem, "! Cruise Control");
-                    cruiseAtivo = !cruiseAtivo;
-                    enviarCruiseCAN(velocidadePiloto, cruiseAtivo);
-                    break;
-                case 3: 
-                    if (cruiseAtivo) {
-                        velocidadePiloto += 5;
-                        if(velocidadePiloto >180) {
-                            velocidadePiloto = 180;
-                        }
-                        enviarCruiseCAN(velocidadePiloto, cruiseAtivo);
-                        strcpy(mensagem, "Velocidade Cruise");
-                    } else {
-                        strcpy(mensagem, "Cruise desligado");
-                    }
-                    break;
-                case 6:
-                    if (cruiseAtivo) {
-                        velocidadePiloto -= 5;
-                        if (velocidadePiloto < 0){
-                            velocidadePiloto = 0;
-                        }
-                        enviarCruiseCAN(velocidadePiloto, cruiseAtivo);
-                    }
-                    break;
-                case 4: 
-                    strcpy(mensagem, "! Mute Alarme");
-                    break;
-            case 5: strcpy(mensagem, "Consumo medio zerado!"); break;
+        if (now-adc_at>=500000) {
+            adc_at=now; int sum_f=0,sum_b=0; bool ok=true;
+            for (int i=0;i<16;i++) {
+                int f,b;
+                if (adc_oneshot_read(adc,ADC_CHANNEL_6,&f)!=ESP_OK ||
+                    adc_oneshot_read(adc,ADC_CHANNEL_7,&b)!=ESP_OK) { ok=false;break; }
+                sum_f+=f;sum_b+=b;
             }
-            mensagemAte = esp_timer_get_time() + 1000000;
-        }
-
-        char linhas[8][17] = {{0}};
-        if (esp_timer_get_time() < mensagemAte) {
-            snprintf(linhas[3], sizeof(linhas[3]), "%.16s", mensagem);
-        } else {
-            snprintf(linhas[0], sizeof(linhas[0]), "%s", menus[menuAtual]);
-
-            if (menuAtual == 0) {
-                if (Mute) {
-                    snprintf(linhas[7], sizeof(linhas[7]), "Mute");
+            if (ok) {
+                float f=clamp((sum_f/16.0f-ADC_EMPTY)*100/(ADC_FULL-ADC_EMPTY),0,100);
+                float b=sum_b/16.0f*100/4095;
+                filtered_fuel=filtered_fuel<0 ? f : .75f*filtered_fuel+.25f*f;
+                filtered_brightness=filtered_brightness<0 ? b : .75f*filtered_brightness+.25f*b;
+                fuel_sample(filtered_fuel,filtered_brightness,now);
+                int contrast=(int)(16+filtered_brightness*239/100);
+                if (contrast!=old_contrast) {
+                    uint8_t cmd[]={0x81,(uint8_t)contrast};
+                    if (oled_commands(cmd,2)==ESP_OK) old_contrast=contrast;
                 }
-                if (cruiseAtivo) {
-                    snprintf(linhas[2], sizeof(linhas[2]), "Cruise");
-                    snprintf(linhas[3], sizeof(linhas[3]), "Velocidade: %d", velocidadePiloto);
-                }
-                snprintf(linhas[4], sizeof(linhas[4]), "Combustivel: %.0f%%", nivelCombustivelAtual);
-                snprintf(linhas[5], sizeof(linhas[5]), "Brilho: %.0f%%", nivelIluminacaoAtual);
-            }
-            if (menuAtual == 1) {
-                snprintf(linhas[2], sizeof(linhas[2]), "Velocidade: %.0f", dados.velocidade);
-                if (dados.setaEsquerda) {
-                    snprintf(linhas[4], sizeof(linhas[4]), "<- SETA");
-                }
-                if (dados.setaDireita) {
-                    snprintf(linhas[5], sizeof(linhas[5]), "SETA ->");
-                }
-            }
-            if (menuAtual == 2) {
-               snprintf(linhas[2], sizeof(linhas[2]), "Temp: %.1f C", dados.temperatura); 
-            }
+            } else { m.adc_ok=false; m.consumption_ready=false; ESP_LOGW(TAG,"Falha ADC"); }
         }
-
-        oled_renderizar(linhas);
-        vTaskDelay(pdMS_TO_TICKS(30));
+        for (int i=0;i<6;i++) gpio_set_level(led_pins[i],m.pcm && m.speed>=(i+1)*25);
+        gpio_set_level(23,!m.mute && now<m.beep_until); /* Buzzer ativo, sem PWM de audio. */
+        twai_node_status_t status;
+        if (twai_node_get_info(can,&status,NULL)==ESP_OK && status.state==TWAI_ERROR_BUS_OFF) {
+            m.tx_error=true;m.cruise=false;
+            if (now-recovery_at>=1000000) { recovery_at=now; twai_node_recover(can); }
+        } else transmit(now);
+        if (now-screen_at>=100000) { screen_at=now;render(now); }
+        vTaskDelayUntil(&tick,pdMS_TO_TICKS(5)>0 ? pdMS_TO_TICKS(5) : 1);
     }
 }
-
-void task_encoder(void *pvParameterEncoder) {
-    int lastStateCLK = gpio_get_level(ENCODER_CLK);
-    int lastStateSW = 1;
-    eventBttn evento;
-
-    while(1) {
-        int currentStateCLK = gpio_get_level(ENCODER_CLK);
-        if (currentStateCLK != lastStateCLK) {
-            if (gpio_get_level(ENCODER_DT) != currentStateCLK) {
-                menuAtual++;
-            } else {
-                menuAtual--;
-            }
-            if (menuAtual > 2) menuAtual = 0;
-            if (menuAtual < 0) menuAtual = 2;
-            printf("Menu atual: %s\n", menus[menuAtual]);
-        }
-        lastStateCLK = currentStateCLK;
-
-        int currentStateSW = gpio_get_level(ENCODER_SW);
-        if (lastStateSW == 1 && currentStateSW == 0) {
-            evento.bttn = 5;
-            xQueueSend(filaBttn, &evento, 0);
-        }
-        lastStateSW = currentStateSW;
-
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+void app_main(void) {
+    uint8_t validation[CLUSTER_TX_DLC];
+    ESP_ERROR_CHECK(cruise_payload(validation,sizeof(validation),0,false) &&
+                    cruise_payload(validation,sizeof(validation),180,true) ? ESP_OK : ESP_ERR_INVALID_ARG);
+    ESP_LOGI(TAG,"Perfil experimental TX=0x%03x DLC=%d bitrate=%d; SEM DBC confirmado",
+             (unsigned)CLUSTER_TX_ID,CLUSTER_TX_DLC,CLUSTER_CAN_BITRATE);
+    rx_queue=xQueueCreate(64,sizeof(Rx)); ESP_ERROR_CHECK(rx_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    tx_results=xQueueCreate(1,sizeof(bool)); ESP_ERROR_CHECK(tx_results ? ESP_OK : ESP_ERR_NO_MEM);
+    uint64_t inputs=(1ULL<<25)|(1ULL<<26);
+    for (int i=0;i<5;i++) inputs|=1ULL<<button_pins[i];
+    gpio_config_t in={.pin_bit_mask=inputs,.mode=GPIO_MODE_INPUT,.pull_up_en=GPIO_PULLUP_ENABLE};
+    ESP_ERROR_CHECK(gpio_config(&in));
+    uint64_t outputs=1ULL<<23;for(int i=0;i<6;i++)outputs|=1ULL<<led_pins[i];
+    gpio_config_t out={.pin_bit_mask=outputs,.mode=GPIO_MODE_OUTPUT};
+    ESP_ERROR_CHECK(gpio_config(&out));
+    ESP_ERROR_CHECK(gpio_set_level(23,0));
+    for(int i=0;i<6;i++)ESP_ERROR_CHECK(gpio_set_level(led_pins[i],0));
+    adc_oneshot_unit_init_cfg_t au={.unit_id=ADC_UNIT_1};
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&au,&adc));
+    adc_oneshot_chan_cfg_t ac={.atten=ADC_ATTEN_DB_12,.bitwidth=ADC_BITWIDTH_12};
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,ADC_CHANNEL_6,&ac));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc,ADC_CHANNEL_7,&ac));
+    i2c_master_bus_config_t bus={.i2c_port=I2C_NUM_0,.sda_io_num=21,.scl_io_num=22,
+        .clk_source=I2C_CLK_SRC_DEFAULT,.glitch_ignore_cnt=7,.flags.enable_internal_pullup=true};
+    i2c_master_bus_handle_t handle; ESP_ERROR_CHECK(i2c_new_master_bus(&bus,&handle));
+    i2c_device_config_t dev={.dev_addr_length=I2C_ADDR_BIT_LEN_7,.device_address=0x3c,.scl_speed_hz=400000};
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(handle,&dev,&oled));
+    const uint8_t init[]={0xae,0xd5,0x80,0xa8,0x3f,0xd3,0,0x40,0x8d,0x14,0x20,2,
+                         0xa1,0xc8,0xda,0x12,0x81,0xff,0xd9,0xf1,0xdb,0x40,0xa4,0xa6,0xaf};
+    ESP_ERROR_CHECK(oled_commands(init,sizeof(init)));
+    twai_onchip_node_config_t cfg={.io_cfg={.tx=17,.rx=16,.quanta_clk_out=-1,.bus_off_indicator=-1},
+        .bit_timing.bitrate=CLUSTER_CAN_BITRATE,.fail_retry_cnt=3,.tx_queue_depth=1,.flags.no_receive_rtr=true};
+    ESP_ERROR_CHECK(twai_new_node_onchip(&cfg,&can));
+    twai_event_callbacks_t callbacks={.on_rx_done=on_rx,.on_tx_done=on_tx};
+    ESP_ERROR_CHECK(twai_node_register_event_callbacks(can,&callbacks,NULL));
+    ESP_ERROR_CHECK(twai_node_enable(can));
+    ESP_ERROR_CHECK(xTaskCreate(controller,"cluster",6144,NULL,5,NULL)==pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 }
-
-void task_bttn(void *pvParameterBttn) {
-    eventBttn evento; 
-    int last_R = 1;
-    int last_Cruise = 1;
-    int last_VPIloto = 1;
-    int last_mute = 1;
-    int tempoSegurando = 0;
-
-    while(1) {
-        int current_R = gpio_get_level(bttn_R);
-        int current_Cruise = gpio_get_level(bttn_Cruise);
-        int current_VPIloto = gpio_get_level(bttn_VPIloto);
-        int current_mute = gpio_get_level(bttn_mute);
-
-        if (last_R == 1 && current_R == 0) {
-            evento.bttn = 1;
-            xQueueSend(filaBttn, &evento, 0);
-        }
-        if (last_Cruise == 1 && current_Cruise == 0) {
-            evento.bttn = 2;
-            xQueueSend(filaBttn, &evento, 0);
-        }
-        if (last_VPIloto == 1 && current_VPIloto == 0) {
-            evento.bttn = 3;
-            xQueueSend(filaBttn, &evento, 0);
-            tempoSegurando = 0;
-        }
-        if (current_VPIloto == 0) {
-            tempoSegurando++;
-            if (tempoSegurando >= 50) {
-                evento.bttn = 6;
-                xQueueSend(filaBttn, &evento, 0);
-                tempoSegurando = 0;
-            }
-        } else {
-            tempoSegurando = 0;
-        }
-        if (last_mute == 1 && current_mute == 0) {
-            Mute = !Mute;
-            if (Mute) {
-                pararBuzzer();
-            }
-            evento.bttn = 4;
-            xQueueSend(filaBttn, &evento, 0);
-        }
-
-        last_R = current_R;
-        last_Cruise = current_Cruise;
-        last_VPIloto = current_VPIloto;
-        last_mute = current_mute;
-
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
-void task_potenciometroIluminacao(void *pvParameterIlu) {
-    float valorFiltrado = -1.0f;
-
-    while(1) {
-        int valorPIluminacao = lerADCMedio(ADC1_CHANNEL_7);
-        float nivelIluminacao = (valorPIluminacao / 4095.0f) * 100.0f;
-        nivelIluminacao = filtrarADC(nivelIluminacao, &valorFiltrado);
-        nivelIluminacaoAtual = (float)((int)(nivelIluminacao + 0.5f));
-        /* xQueueOverwrite(filaIluminacao, &nivelIlumincao); */
-        printf("Nivel Iluminacao: %.0f%%\n", nivelIluminacaoAtual);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
-
-void task_potenciometroCombustivel(void *pvParameterComb) {
-    float valorFiltrado = -1.0f;
-    bool combustivelBaixo = false;
-
-    while (1) {
-        int valorPCombustivel = lerADCMedio(ADC1_CHANNEL_6);
-        float nivelCombustivel = (valorPCombustivel / 4095.0f) * 100.0f;
-        nivelCombustivel = filtrarADC(nivelCombustivel, &valorFiltrado);
-        nivelCombustivelAtual = (float)((int)(nivelCombustivel + 0.5f));
-        /* xQueueOverwrite(filaCombustivel, &nivelCombustivel); */
-        printf("Nivel Combustivel: %.0f%%\n", nivelCombustivelAtual);
-
-        if (!combustivelBaixo && nivelCombustivel < 10.0f) {
-            combustivelBaixo = true;
-        } else if (combustivelBaixo && nivelCombustivel > 11.0f) {
-            combustivelBaixo = false;
-        }
-
-        if (combustivelBaixo) {
-            solicitarBuzzer(BUZZER_PULSE_MS);
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    } 
-}
-
-void iniciarSistema (void){
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
-    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11); // GPIO35
-
-    ledc_timer_config_t timer = {
-        .speed_mode       = LEDC_HIGH_SPEED_MODE,
-        .duty_resolution  = LEDC_TIMER_10_BIT,
-        .timer_num        = LEDC_TIMER_0,
-        .freq_hz          = 440,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&timer);
-
-    ledc_channel_config_t channel = {
-        .gpio_num       = BUZZER_pino,
-        .speed_mode     = LEDC_HIGH_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_0,
-        .timer_sel      = LEDC_TIMER_0,
-        .duty           = 0,
-        .hpoint         = 0
-    };
-    ledc_channel_config(&channel);
-    ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
-
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL<<bttn_R) | (1ULL<<bttn_Cruise) | (1ULL<<bttn_VPIloto) | (1ULL<<bttn_mute),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
-
-    gpio_config_t encoder_conf = {
-    .pin_bit_mask = (1ULL<<ENCODER_CLK) | (1ULL<<ENCODER_DT) | (1ULL<<ENCODER_SW),
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en = GPIO_PULLUP_ENABLE,
-    .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&encoder_conf);
-
-    gpio_config_t led_conf = {
-    .pin_bit_mask = (1ULL << LED1) | (1ULL << LED2) | (1ULL << LED3) | (1ULL << LED4) | (1ULL << LED5) | (1ULL << LED6),
-    .mode = GPIO_MODE_OUTPUT,
-    .pull_up_en = GPIO_PULLUP_DISABLE,
-    .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&led_conf);
-    atualizarBarra(0);
-
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-            GPIO_NUM_17,   // TX
-            GPIO_NUM_16,   // RX
-            TWAI_MODE_NORMAL
-        );
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-    twai_driver_install(&g_config, &t_config, &f_config);
-    twai_start();
-
-    i2c_master_init(&Oled, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
-    ssd1306_init(&Oled, 128, 64);
-    ssd1306_clear_screen(&Oled, false);
-    ssd1306_contrast(&Oled, 0xff);
-    ssd1306_display_text(&Oled, 0, "Sistema CAN", 11, false);
-    ssd1306_display_text(&Oled, 2, menus[0], strlen(menus[0]), false);
-    ssd1306_display_text(&Oled, 4, "OLED iniciado", 13, false);
-
-    /* filaCombustivel = xQueueCreate(1, sizeof(float));
-    filaIluminacao = xQueueCreate(1, sizeof(float)); */
-    filaCAN = xQueueCreate(1, sizeof(dadosCAN));
-    filaBttn = xQueueCreate(10, sizeof(eventBttn));
-    if (/* filaCombustivel == NULL ||  */filaCAN == NULL || filaBttn == NULL) {
-        printf("Erro ao criar fila!\n");
-    }
-    
-}
+#endif
